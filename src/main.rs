@@ -1,6 +1,11 @@
 use colored::*;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::alloc::{alloc, dealloc, GlobalAlloc, Layout, System};
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 struct MemoryTracker;
 
@@ -40,6 +45,10 @@ fn get_stack_usage() -> usize {
         &x as *const i32 as usize
     };
 
+    // The #[inline(never)] attribute ensures this function is not inlined,
+    // which is crucial for accurate stack usage estimation. It forces the
+    // function to have its own stack frame, creating a measurable distance
+    // between this "bottom" address and the "top" address in the calling function.
     #[inline(never)]
     fn get_approximate_stack_bottom() -> usize {
         let y = 0;
@@ -48,6 +57,53 @@ fn get_stack_usage() -> usize {
 
     let stack_bottom = get_approximate_stack_bottom();
     stack_top.saturating_sub(stack_bottom)
+}
+
+struct MemoryState {
+    allocations: Vec<(Layout, *mut u8)>,
+}
+
+impl MemoryState {
+    fn new() -> Self {
+        MemoryState {
+            allocations: Vec::new(),
+        }
+    }
+
+    fn allocate(&mut self, size: usize) {
+        let layout = Layout::from_size_align(size, 8).unwrap();
+        unsafe {
+            let ptr = alloc(layout);
+            if !ptr.is_null() {
+                self.allocations.push((layout, ptr));
+                // Directly update HEAP_USAGE
+                HEAP_USAGE.fetch_add(layout.size(), Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn deallocate(&mut self) {
+        if let Some((layout, ptr)) = self.allocations.pop() {
+            unsafe {
+                dealloc(ptr, layout);
+                // Directly update HEAP_USAGE
+                HEAP_USAGE.fetch_sub(layout.size(), Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Drop for MemoryState {
+    fn drop(&mut self) {
+        while !self.allocations.is_empty() {
+            self.deallocate();
+        }
+    }
+}
+
+fn clear_screen() {
+    print!("\x1B[2J\x1B[1;1H");
+    io::stdout().flush().unwrap();
 }
 
 fn visualize_memory(depth: usize) {
@@ -81,29 +137,55 @@ fn visualize_memory(depth: usize) {
     visualize_stack_growth(depth);
 }
 
+static UPDATE_VISUALIZATION: AtomicBool = AtomicBool::new(false);
+
+fn update_visualization() {
+    UPDATE_VISUALIZATION.store(true, Ordering::SeqCst);
+}
+
 fn main() {
-    println!("{}", "Initial memory state:".bold());
-    visualize_memory(3);
+    let memory_state = Arc::new(Mutex::new(MemoryState::new()));
+    let memory_state_clone = Arc::clone(&memory_state);
 
-    // Allocate some heap memory
-    let _data = vec![1, 2, 3, 4, 5];
-    println!("\n{}", "After allocating small vector:".bold());
-    visualize_memory(3);
+    // Spawn a thread for visualization
+    thread::spawn(move || loop {
+        if UPDATE_VISUALIZATION.load(Ordering::SeqCst) {
+            clear_screen();
+            visualize_memory(3);
+            UPDATE_VISUALIZATION.store(false, Ordering::SeqCst);
+        }
+        thread::sleep(Duration::from_millis(100));
+    });
 
-    // Allocate more heap memory
-    let _more_data = vec![0; 1_000_000];
-    println!("\n{}", "After allocating large vector:".bold());
-    visualize_memory(3);
+    // Initial visualization
+    update_visualization();
 
-    // Allocate a boxed value
-    let _boxed = Box::new(42);
-    println!("\n{}", "After allocating Box<i32>:".bold());
-    visualize_memory(3);
+    // Main loop for user input
+    loop {
+        io::stdout().flush().unwrap();
 
-    // Clean up
-    drop(_data);
-    drop(_more_data);
-    drop(_boxed);
-    println!("\n{}", "After deallocations:".bold());
-    visualize_memory(3);
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+
+        match parts.get(0).map(|s| *s) {
+            Some("a") => {
+                if let Some(size) = parts.get(1).and_then(|s| s.parse().ok()) {
+                    memory_state_clone.lock().unwrap().allocate(size);
+                    update_visualization();
+                } else {
+                    println!("Invalid size");
+                }
+            }
+            Some("d") => {
+                memory_state_clone.lock().unwrap().deallocate();
+                update_visualization();
+            }
+            Some("v") => {
+                update_visualization();
+            }
+            Some("q") => break,
+            _ => println!("Invalid command"),
+        }
+    }
 }
