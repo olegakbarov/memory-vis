@@ -42,5 +42,3 @@ The program displays:
 cargo build --release
 cargo run --release
 ```
-
-This tool is useful for understanding memory behavior in Rust programs and for educational purposes in systems programming courses.
